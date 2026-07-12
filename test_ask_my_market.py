@@ -46,6 +46,37 @@ def test_coerce_validates_boundary():
     assert c["wtp_tier"] == "just_complaining"
     assert c["time_to_pay"] == "unknown"
     assert c["judgment_on_stream"] is True  # truthy string coerced to bool
+    assert c["industry"] == "other"          # missing industry -> safe default
+
+
+def test_coerce_normalizes_industry():
+    assert m._coerce({"industry": "  Real Estate "})["industry"] == "real estate"
+
+
+def test_persistence_merge_and_bump():
+    store = {"_meta": {}, "findings": {}}
+    rec = {"source_url": "https://reddit.com/a", "fit_score": 70, "verdict": "worth_a_call"}
+    m.merge_new(store, [rec], "2026-01-01T00:00:00+00:00")
+    got = store["findings"]["https://reddit.com/a"]
+    assert got["times_seen"] == 1 and got["first_seen"] == got["last_seen"]
+    # same url surfaces again a later run -> frequency signal grows, first_seen preserved
+    m.bump_seen(store, ["https://reddit.com/a"], "2026-01-03T00:00:00+00:00")
+    got = store["findings"]["https://reddit.com/a"]
+    assert got["times_seen"] == 2
+    assert got["first_seen"] == "2026-01-01T00:00:00+00:00"
+    assert got["last_seen"] == "2026-01-03T00:00:00+00:00"
+
+
+def test_load_store_tolerates_missing_and_corrupt(tmp_path=None):
+    import tempfile, os as _os
+    d = tempfile.mkdtemp()
+    missing = _os.path.join(d, "nope.json")
+    s = m.load_store(missing)
+    assert s == {"_meta": {}, "findings": {}}
+    bad = _os.path.join(d, "bad.json")
+    open(bad, "w").write("{not json")
+    s = m.load_store(bad)   # corrupt -> fresh, never crashes
+    assert s["findings"] == {}
 
 
 def test_safe_href_blocks_dangerous_schemes():
@@ -57,31 +88,42 @@ def test_safe_href_blocks_dangerous_schemes():
     assert m._safe_href("") == "" and m._safe_href(None) == ""
 
 
+def _store(*recs):
+    return {"_meta": {}, "findings": {r["source_url"]: r for r in recs}}
+
+
 def test_render_drops_unsafe_link_but_keeps_row():
     rec = {"verdict": "worth_a_call", "fit_score": 90, "wtp_tier": "paying_a_human",
-           "pain": "p", "quote": "q", "where_they_gather": "r/x",
-           "source_url": "javascript:alert(document.cookie)", "source_type": "reddit"}
-    out = m.render_html([rec], 1, 1)
+           "industry": "accounting", "pain": "p", "quote": "q", "where_they_gather": "r/x",
+           "source_url": "javascript:alert(document.cookie)", "source_type": "reddit", "times_seen": 1}
+    out = m.render_html(_store(rec), {"fetched": 1, "new_count": 1, "new_urls": set()})
     assert "javascript:alert" not in out   # never reaches the HTML
     assert "worth_a_call" in out           # row still rendered
 
 
-def test_prefilter_dedups_and_balances():
+def test_render_escapes_script_in_scraped_text():
+    rec = {"verdict": "skip", "fit_score": 10, "wtp_tier": "just_complaining", "industry": "x",
+           "pain": "</td></tr><script>alert(1)</script>", "quote": "q", "where_they_gather": "w",
+           "source_url": "https://reddit.com/x", "source_type": "reddit", "times_seen": 1}
+    out = m.render_html(_store(rec), {"fetched": 1, "new_count": 0, "new_urls": set()})
+    assert "<script>alert(1)</script>" not in out   # escaped, not injected
+
+
+def test_prefilter_dedups_and_balances_by_community():
     body = "a body with plenty of characters to clear the minimum length filter"
     items = []
-    for i in range(5):
-        items.append(m.make_item("reddit", f"rurl{i}", f"reddit title {i}", body, f"rurl{i}", "r/x", "2025-01-01"))
-    for i in range(5):
-        items.append(m.make_item("hackernews", f"hurl{i}", f"hn title {i}", body, f"hurl{i}", "Hacker News", "2026-01-01"))
+    for where, st in [("r/a", "reddit"), ("r/b", "reddit"), ("Hacker News", "hackernews")]:
+        for i in range(4):
+            u = f"{where}-{i}"
+            items.append(m.make_item(st, u, f"{where} title {i}", body, u, where, "2025-01-01"))
     items.append(items[0])          # duplicate -> dropped
-    items.append(m.make_item("reddit", "tiny", "x", "y", "tiny", "r/x", "2025"))  # too short -> dropped
+    items.append(m.make_item("reddit", "tiny", "x", "y", "tiny", "r/a", "2025"))  # too short -> dropped
 
     kept = m.prefilter(items, limit=6)
     assert len(kept) == 6
-    urls = [k["url"] for k in kept]
-    assert len(set(urls)) == 6                       # no dupes
-    srcs = [k["source_type"] for k in kept]
-    assert srcs.count("reddit") == 3 and srcs.count("hackernews") == 3  # balanced
+    assert len(set(k["url"] for k in kept)) == 6     # no dupes
+    wheres = [k["where"] for k in kept]              # round-robin across 3 communities -> 2 each
+    assert wheres.count("r/a") == 2 and wheres.count("r/b") == 2 and wheres.count("Hacker News") == 2
 
 
 if __name__ == "__main__":

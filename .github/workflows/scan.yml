@@ -1,0 +1,63 @@
+name: scan
+
+# Runs the pain scanner on a schedule, commits the accumulated memory
+# (data/findings.json) back to the repo, and publishes the dashboard to Pages.
+# No live server - a free runner produces a static page every couple of days.
+
+on:
+  schedule:
+    # every 2 days at 06:00 UTC (github cron: */2 day-of-month; ~1-day gap once per month)
+    - cron: "0 6 */2 * *"
+  workflow_dispatch: {}   # manual "Run workflow" button
+
+permissions:
+  contents: write   # commit updated findings.json
+  pages: write      # deploy to Pages
+  id-token: write   # deploy-pages OIDC
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55   # first seed run grinds slowly through pullpush backoffs across ~166 subs
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run scan
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python ask_my_market.py --no-open --out public/index.html --data data/findings.json
+
+      - name: Commit updated memory
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/findings.json
+          if git diff --staged --quiet; then
+            echo "no memory changes"
+          else
+            git commit -m "chore: update findings memory [skip ci]"
+            git push
+          fi
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -1,51 +1,86 @@
 # bruh, just check the market
 
-A personal, single-sitting pain-discovery instrument. Not a product.
+A personal, economy-wide pain-discovery instrument. Not a product.
 It mines Reddit + Hacker News for one specific shape of opportunity:
 
 > A human being paid, or actively paying, to apply repeated judgment to a stream of information.
 
 That is the shape of an agentic product hiding in the open. Claude reads each
-candidate through one opinionated founder filter and every result carries
-*where those people gather*, so the output doubles as an outreach target list.
+candidate through one opinionated founder filter; every result carries its
+**industry** and **where those people gather**, so the output doubles as an
+outreach target list. It runs itself every 2 days and publishes a filterable
+dashboard to GitHub Pages - no live server, no running cost.
 
-## Run it
+## What v2 adds
+
+- **Whole economy, not just tech.** [`industries.py`](./industries.py) is a taxonomy of
+  **36 GDP sectors / 166 operator subreddits** - agriculture, trucking, dental, legal,
+  oil & gas, funeral homes, customs compliance, and on. Every finding is tagged with an `industry`.
+- **Memory.** [`data/findings.json`](./data) accumulates across runs (dedup by URL) and tracks
+  `times_seen` - a pain that keeps resurfacing is a stronger signal. The dashboard grows into a
+  standing board instead of a throwaway snapshot.
+- **Hosted dashboard.** A GitHub Action runs the scan every 2 days and deploys a redesigned,
+  filterable dashboard (summary cards, live filters by verdict / industry / wtp-tier / source,
+  full-text search) to GitHub Pages.
+
+## The pipeline
+
+```
+load memory -> fetch (Reddit + HN) -> prefilter -> skip already-seen
+  -> Claude judgment (new items only) -> merge into memory -> render dashboard -> open
+```
+
+Two files do the work: [`ask_my_market.py`](./ask_my_market.py) (logic) and
+[`industries.py`](./industries.py) (the sector/subreddit/query taxonomy - edit freely).
+
+## Run it locally
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 export ANTHROPIC_API_KEY=sk-ant-...
 
-python ask_my_market.py                    # full run -> writes + opens report.html
-python ask_my_market.py --dry-run          # fetch + prefilter only, zero API cost
+python ask_my_market.py                 # incremental run -> writes + opens report.html
+python ask_my_market.py --reseed        # re-pull the frozen Reddit archive (full seed)
+python ask_my_market.py --dry-run       # fetch + prefilter only, zero API cost
 python ask_my_market.py --sample --limit 20   # fast smoke test (tiny source subset)
-python ask_my_market.py --no-open          # headless (don't open browser)
 ```
 
-Output is a single self-contained `report.html`: one row per item, sorted by
-`fit_score` descending, verdict color-coded, with a checkbox to hide `skip` rows.
+Useful flags: `--limit N` (max NEW items classified), `--data PATH` (memory file),
+`--out PATH` (dashboard path), `--no-open`.
 
-## The pipeline
+## Host it on GitHub Pages (zero running cost)
 
-```
-config (subreddits + queries)
-  -> fetch  (Reddit + Hacker News)
-  -> prefilter  (dedup by url, drop un-judgeable noise)
-  -> Claude judgment layer  (classify each survivor)
-  -> report.html  -> open in browser
-```
+One-time setup:
 
-Everything is one file: [`ask_my_market.py`](./ask_my_market.py). Edit the
-`CONFIG` block at the top - subreddits, queries, and the `WEIGHTS` dict that
-drives `fit_score`.
+1. **Add your API key as a repo secret** (uploads your key to *your* repo's secrets):
+   ```bash
+   gh secret set ANTHROPIC_API_KEY --repo DavidKorochik/bruh-just-check-the-market
+   ```
+2. **Turn on Pages -> GitHub Actions** (Settings -> Pages -> Source: GitHub Actions), or:
+   ```bash
+   gh api -X POST repos/DavidKorochik/bruh-just-check-the-market/pages -f build_type=workflow
+   ```
+3. **Seed the memory once.** The first run is the slow one (it grinds through pullpush rate-limits
+   across 166 subs). Either run `python ask_my_market.py --reseed` locally and commit
+   `data/findings.json`, or trigger the Action once:
+   ```bash
+   gh workflow run scan.yml
+   ```
+
+After that, [`.github/workflows/scan.yml`](./.github/workflows/scan.yml) runs every 2 days:
+scans (only new items are classified), commits the updated memory, and deploys the dashboard.
+Your link: `https://davidkorochik.github.io/bruh-just-check-the-market/`.
+
+> The Pages site is **public** (public repo). It shows public Reddit/HN data plus your scoring.
 
 ## How scoring works
 
-Claude returns the *judgment* fields (`wtp_tier`, `judgment_on_stream`, ...).
-`fit_score` and `verdict` are computed **in Python** from the `WEIGHTS` dict, so
-the math is deterministic and you tune scoring in one place instead of editing a
-prompt. `paying_a_human` is weighted hardest - money already moving to a human
-is the strongest signal that an agent can take the job.
+Claude returns the *judgment* fields (`wtp_tier`, `judgment_on_stream`, `industry`, ...).
+`fit_score` and `verdict` are computed **in Python** from the `WEIGHTS` dict in
+`ask_my_market.py`, so the math is deterministic and you tune scoring in one place.
+`paying_a_human` is weighted hardest - money already moving to a human is the strongest
+signal an agent can take the job.
 
 | verdict        | fit_score |
 |----------------|-----------|
@@ -53,22 +88,30 @@ is the strongest signal that an agent can take the job.
 | `watch`        | 40 - 64   |
 | `skip`         | < 40      |
 
-## A note on the Reddit source (the "GummySearch lesson", on day one)
+## A note on the Reddit source (the "GummySearch lesson")
 
-Reddit's public `.json` endpoints now hard-block non-browser / flagged IPs with
-a `403`. The tool tries the official endpoint first and **falls back to
-[pullpush.io](https://pullpush.io)** (a no-auth Pushshift successor) when
-blocked. pullpush is a *queryable archive* (its index currently lags ~1 year),
-so Reddit results are older but still valid pain; Hacker News carries the fresh
-signal. One source failing never kills a run.
+Reddit's public `.json` now hard-blocks flagged IPs with a `403`. The tool probes the official
+endpoint first and **falls back to [pullpush.io](https://pullpush.io)** (a no-auth Pushshift
+successor) when blocked. pullpush is a *queryable archive* (its index lags ~1 year), so Reddit
+findings are older but still valid pain; Hacker News carries the fresh signal. Because runs
+accumulate, the frozen archive is seeded once and then skipped - incremental runs lean on HN.
+One source failing never kills a run.
 
-## Roadmap (not built - later sessions)
+## Tests
 
-Freelance-marketplace recurring-gig detection · competitor 1-2 star review
-mining · niche forums / vertical Slack-Discord archives · X / Bluesky ·
-cross-run persistence + frequency-over-time · daily digest of `worth_a_call` ·
-embedding clustering of duplicate pains · per-source resilience.
+```bash
+python test_ask_my_market.py     # or: pytest -q
+```
 
-If continuous monitoring of a public stream for a specific buyer validates in
-real founder conversations, *that* is when the monitoring engine becomes the
-product. Not before. This v1 is built for the decision, not the imagined product.
+No network, no API - covers scoring, thresholds, JSON parsing, boundary coercion, XSS/URL
+safety, persistence merge/bump, and prefilter community-balance.
+
+## Roadmap (later sessions)
+
+Freelance-marketplace recurring-gig detection · competitor 1-2 star review mining · niche
+forums / vertical Slack-Discord archives · X / Bluesky · embedding-based clustering of duplicate
+pains · daily digest email of `worth_a_call` items.
+
+If continuous monitoring of a public stream for a specific buyer validates in real founder
+conversations, *that* is when this monitoring engine becomes the product. Built for the decision,
+not the imagined product.

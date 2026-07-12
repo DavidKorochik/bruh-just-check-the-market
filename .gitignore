@@ -2,5 +2,8 @@
 __pycache__/
 *.pyc
 report.html
+public/
 .a5c/
 .DS_Store
+
+# data/findings.json is the cross-run MEMORY - intentionally NOT ignored (committed by the Action).
