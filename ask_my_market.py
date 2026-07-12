@@ -52,6 +52,16 @@ from industries import BASE_QUERIES, HN_QUERIES, INDUSTRIES
 # Fast + cheap classifier. Swap here to trade cost for depth.
 MODEL = "claude-haiku-4-5-20251001"
 
+# --- Competition check ----------------------------------------------------
+# For high-fit ideas, ask Claude to LIVE web-search for existing competitors and
+# then sanity-check the search against its own prior knowledge. FLAG ONLY - it
+# NEVER changes fit_score/verdict; it's informational (a dashboard column + filter),
+# so an overcrowded market is visible but you make the call.
+COMPETITION_MODEL = "claude-haiku-4-5-20251001"   # swap to "claude-sonnet-5" for deeper analysis
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
+COMPETITION_VERDICTS = ("worth_a_call", "watch")  # only research competitors for these (skips ignored)
+COMPETITION_WORKERS = 4
+
 # --- fit_score weights  -  TUNE THESE. Scoring is done in Python (not the model)
 # so this dict is the single source of truth and the model never does math.
 WEIGHTS = {
@@ -376,12 +386,11 @@ def classify_item(client, item):
     c["source_url"] = item["url"]
     c["source_type"] = item["source_type"]
     c["where_they_gather"] = c["where_they_gather"] or item["where"]
+    c.update(_default_competition())   # every record carries competition fields; high-fit ones get filled
     return c
 
 
-def classify_all(items):
-    import anthropic
-    client = anthropic.Anthropic()
+def classify_all(client, items):
     results, done = [], 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as pool:
         futures = [pool.submit(classify_item, client, it) for it in items]
@@ -393,6 +402,114 @@ def classify_all(items):
             print(f"\r  classified {done}/{len(items)}", end="", flush=True)
     print()
     return results
+
+
+# =============================================================================
+# Competition check  -  is this idea already an overcrowded market? (flag only)
+# =============================================================================
+
+VALID_COMPETITION = {"open_field", "some_players", "crowded", "saturated", "not_checked"}
+
+
+def _default_competition():
+    return {"competition_level": "not_checked", "competitors": [],
+            "comp_rationale": "", "comp_confidence": "unknown", "comp_sanity": ""}
+
+
+def _all_text(msg):
+    """Join ALL text blocks in order. Web-search answers split cited claims (e.g. the
+    competitor names we want) across multiple text blocks, so last-block-only would drop them."""
+    return "".join(b.text for b in msg.content
+                   if getattr(b, "type", None) == "text" and getattr(b, "text", None))
+
+
+def _coerce_competition(c):
+    if c.get("competition_level") not in VALID_COMPETITION:
+        c["competition_level"] = "not_checked"
+    comps = c.get("competitors")
+    comps = comps if isinstance(comps, list) else []
+    c["competitors"] = [str(x).strip()[:100] for x in comps if str(x).strip()][:6]
+    c["comp_rationale"] = str(c.get("rationale") or c.get("comp_rationale") or "").strip()[:240]
+    c["comp_confidence"] = c.get("confidence") if c.get("confidence") in {"low", "medium", "high"} else "unknown"
+    c["comp_sanity"] = str(c.get("sanity_check") or c.get("comp_sanity") or "").strip()[:240]
+    # keep only our normalized keys
+    return {k: c[k] for k in ("competition_level", "competitors", "comp_rationale", "comp_confidence", "comp_sanity")}
+
+
+COMPETITION_PROMPT = """A solo founder is weighing whether to build a product that solves this pain:
+
+  "{pain}"  (industry: {industry})
+
+Assess the COMPETITIVE landscape - is this already a served, crowded market, or an open field?
+
+{search_instr}Then SANITY-CHECK yourself: compare what you found against your own prior knowledge. Do they
+agree? If web results and your knowledge disagree, say so and lower your confidence.
+
+Return ONLY a strict JSON object (no prose, no fences):
+  "competition_level": one of "open_field" (no/weak players), "some_players" (a few, beatable),
+                       "crowded" (many established), "saturated" (dominated by strong incumbents).
+  "competitors":       up to 6 real named products/tools/services that already address this ("Name - what it does").
+  "rationale":         one sentence justifying the level.
+  "confidence":        "low" | "medium" | "high".
+  "sanity_check":      one sentence - did web search and your own knowledge agree? note any gap."""
+
+
+def _ask_competition(client, record, use_web):
+    """One assessment pass. Web branch gets a bigger token budget (server-injected search
+    results eat into it) and a pause_turn loop (long web-search turns pause and must continue)."""
+    instr = ("Use web search to find REAL existing products/tools/services that already solve this. "
+             if use_web else "Judge from your own knowledge of the market. ")
+    prompt = COMPETITION_PROMPT.format(pain=record.get("pain", ""),
+                                       industry=record.get("industry", ""), search_instr=instr)
+    messages = [{"role": "user", "content": prompt}]
+    kwargs = {"model": COMPETITION_MODEL, "max_tokens": 2500 if use_web else 900}
+    if use_web:
+        kwargs["tools"] = [WEB_SEARCH_TOOL]
+    msg = None
+    for _ in range(4):   # continue across pause_turn (long-running web-search turns)
+        msg = client.messages.create(messages=messages, **kwargs)
+        if msg.stop_reason != "pause_turn":
+            break
+        messages.append({"role": "assistant", "content": msg.content})
+    if msg.stop_reason == "max_tokens":
+        print(f"  [competition] response truncated (max_tokens) for {record.get('source_url')}", file=sys.stderr)
+    return _coerce_competition(_extract_json(_all_text(msg)))
+
+
+def assess_competition(client, record, use_web=True):
+    """Research competitors for one high-fit idea. Web search primary; on any error
+    (web search disabled/errored/truncated) fall back to a model-knowledge-only pass -
+    logged, so a silent always-fallback can't hide."""
+    try:
+        return _ask_competition(client, record, use_web)
+    except Exception as e:
+        if use_web:
+            print(f"  [competition] web search failed for {record.get('source_url')} ({e}); "
+                  f"falling back to model knowledge", file=sys.stderr)
+            try:
+                return _ask_competition(client, record, use_web=False)
+            except Exception as e2:
+                e = e2
+        print(f"  [competition] gave up on {record.get('source_url')}: {e}", file=sys.stderr)
+        return None
+
+
+def attach_competition(client, results, use_web=True):
+    """Gate to high-fit items, research each concurrently, attach the fields in place."""
+    targets = [r for r in results if r.get("verdict") in COMPETITION_VERDICTS]
+    if not targets:
+        return
+    print(f"Checking competition for {len(targets)} high-fit ideas (web search={'on' if use_web else 'off'})...")
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=COMPETITION_WORKERS) as pool:
+        fut_map = {pool.submit(assess_competition, client, r, use_web): r for r in targets}
+        for fut in concurrent.futures.as_completed(fut_map):
+            done += 1
+            comp = fut.result()
+            if comp:
+                fut_map[fut].update(comp)
+            print(f"\r  competition {done}/{len(targets)}", end="", flush=True)
+    print()
 
 
 # =============================================================================
@@ -444,6 +561,9 @@ def save_store(path, store):
 # =============================================================================
 
 VERDICT_COLOR = {"worth_a_call": "#1a7f37", "watch": "#b7791f", "skip": "#6b7280"}
+# green = open field (good), red = saturated (bad) - the market's verdict alongside the pain's
+COMPETITION_COLOR = {"open_field": "#1a7f37", "some_players": "#0969da", "crowded": "#b7791f",
+                     "saturated": "#cf222e", "not_checked": "#6b7280"}
 
 
 def _safe_href(url):
@@ -457,9 +577,13 @@ def render_html(store, run_stats):
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     counts = {"worth_a_call": 0, "watch": 0, "skip": 0}
     industries = {}
+    # "open lane" = a worth-a-call idea that is NOT already a crowded/saturated market
+    open_lane = 0
     for r in findings:
         counts[r.get("verdict", "skip")] = counts.get(r.get("verdict", "skip"), 0) + 1
         industries[r.get("industry", "other")] = industries.get(r.get("industry", "other"), 0) + 1
+        if r.get("verdict") == "worth_a_call" and r.get("competition_level") in ("open_field", "some_players"):
+            open_lane += 1
     new_urls = run_stats.get("new_urls", set())
 
     ind_options = "".join(f'<option value="{html.escape(k)}">{html.escape(k)} ({v})</option>'
@@ -476,12 +600,29 @@ def render_html(store, run_stats):
         is_new = r.get("source_url") in new_urls
         newbadge = '<span class="new">NEW</span>' if is_new else ""
         seen = r.get("times_seen", 1)
-        search_blob = html.escape(f"{r.get('pain','')} {r.get('quote','')} {r.get('where_they_gather','')} {r.get('industry','')}".lower())
+        # competition cell: colored level badge + confidence letter, tooltip = rationale + competitors
+        comp = r.get("competition_level", "not_checked")
+        competitors = r.get("competitors", []) or []
+        conf = r.get("comp_confidence", "unknown")
+        if comp == "not_checked":
+            comp_cell = '<span class="dim">-</span>'
+        else:
+            tip = r.get("comp_rationale", "")
+            if competitors:
+                tip = (tip + " | " if tip else "") + "; ".join(competitors)
+            if r.get("comp_sanity"):
+                tip += f"  (sanity: {r['comp_sanity']})"
+            conf_sup = f'<span class="conf" title="confidence">{html.escape(conf[0])}</span>' if conf != "unknown" else ""
+            comp_cell = (f'<span class="badge" style="background:{COMPETITION_COLOR.get(comp, "#6b7280")}" '
+                         f'title="{html.escape(tip[:400])}">{html.escape(comp.replace("_", " "))}</span>{conf_sup}')
+        search_blob = html.escape(f"{r.get('pain','')} {r.get('quote','')} {r.get('where_they_gather','')} "
+                                  f"{r.get('industry','')} {' '.join(competitors)}".lower())
         rows.append(f"""
       <tr data-verdict="{v}" data-industry="{html.escape(r.get('industry','other'))}" data-wtp="{html.escape(r.get('wtp_tier',''))}"
-          data-source="{src}" data-new="{'1' if is_new else '0'}" data-search="{search_blob}">
+          data-source="{src}" data-competition="{comp}" data-new="{'1' if is_new else '0'}" data-search="{search_blob}">
         <td class="num">{r.get('fit_score',0)}{newbadge}</td>
         <td><span class="badge" style="background:{color}">{html.escape(v)}</span></td>
+        <td>{comp_cell}</td>
         <td>{html.escape(r.get('industry','other'))}</td>
         <td>{html.escape(r.get('wtp_tier',''))}</td>
         <td>{html.escape(r.get('pain',''))}</td>
@@ -498,6 +639,7 @@ def render_html(store, run_stats):
     cards = "".join([
         card(len(findings), "total findings"),
         card(counts["worth_a_call"], "worth a call", VERDICT_COLOR["worth_a_call"]),
+        card(open_lane, "worth a call + open lane", COMPETITION_COLOR["open_field"]),
         card(counts["watch"], "watch", VERDICT_COLOR["watch"]),
         card(run_stats.get("new_count", 0), "new this run", "#8957e5"),
         card(len(industries), "industries covered"),
@@ -537,6 +679,9 @@ def render_html(store, run_stats):
   .badge {{ color: #fff; padding: 2px 9px; border-radius: 999px; font-size: 12px; white-space: nowrap; }}
   .new {{ background: #8957e5; color: #fff; font-size: 9px; font-weight: 700; padding: 1px 5px;
     border-radius: 4px; margin-left: 6px; vertical-align: middle; }}
+  .conf {{ color: var(--dim); font-size: 10px; margin-left: 4px; text-transform: uppercase; cursor: help; }}
+  .dim {{ color: var(--dim); }}
+  .badge[title] {{ cursor: help; }}
   a {{ color: var(--accent); text-decoration: none; }}
   tr:hover td {{ background: var(--panel); }}
 </style></head>
@@ -550,6 +695,10 @@ def render_html(store, run_stats):
   <div class="controls">
     <select id="fVerdict"><option value="">all verdicts</option>
       <option value="worth_a_call">worth a call</option><option value="watch">watch</option><option value="skip">skip</option></select>
+    <select id="fCompetition"><option value="">all competition</option>
+      <option value="open_field">open field</option><option value="some_players">some players</option>
+      <option value="crowded">crowded</option><option value="saturated">saturated</option>
+      <option value="not_checked">not checked</option></select>
     <select id="fIndustry"><option value="">all industries</option>{ind_options}</select>
     <select id="fWtp"><option value="">all wtp tiers</option>
       <option value="paying_a_human">paying a human</option><option value="paying_for_bad_tool">paying for bad tool</option>
@@ -563,22 +712,25 @@ def render_html(store, run_stats):
 
   <table>
     <thead><tr>
-      <th>fit</th><th>verdict</th><th>industry</th><th>wtp tier</th><th>pain</th>
+      <th>fit</th><th>verdict</th><th title="market saturation from live web search">competition</th>
+      <th>industry</th><th>wtp tier</th><th>pain</th>
       <th>sharpest quote</th><th>where they gather</th><th>seen</th><th>source</th>
     </tr></thead>
-    <tbody id="tb">{''.join(rows) if rows else '<tr><td colspan="9">No findings yet. Run a scan.</td></tr>'}</tbody>
+    <tbody id="tb">{''.join(rows) if rows else '<tr><td colspan="10">No findings yet. Run a scan.</td></tr>'}</tbody>
   </table>
 <script>
   var rows = Array.prototype.slice.call(document.querySelectorAll('#tb tr[data-verdict]'));
-  var ctl = {{v:'fVerdict', i:'fIndustry', w:'fWtp', s:'fSource', q:'fSearch', n:'fNew'}};
-  Object.keys(ctl).forEach(function(k){{ var el=document.getElementById(ctl[k]); if(el) el.addEventListener('input', apply); }});
+  ['fVerdict','fCompetition','fIndustry','fWtp','fSource','fSearch','fNew'].forEach(function(id){{
+    var el=document.getElementById(id); if(el) el.addEventListener('input', apply);
+  }});
   function apply() {{
-    var v=val('fVerdict'), i=val('fIndustry'), w=val('fWtp'), s=val('fSource'),
+    var v=val('fVerdict'), c=val('fCompetition'), i=val('fIndustry'), w=val('fWtp'), s=val('fSource'),
         q=val('fSearch').toLowerCase(), n=document.getElementById('fNew').checked;
     var shown=0;
     rows.forEach(function(r){{
-      var ok = (!v||r.dataset.verdict===v) && (!i||r.dataset.industry===i) && (!w||r.dataset.wtp===w)
-            && (!s||r.dataset.source===s) && (!n||r.dataset.new==='1') && (!q||r.dataset.search.indexOf(q)>-1);
+      var ok = (!v||r.dataset.verdict===v) && (!c||r.dataset.competition===c) && (!i||r.dataset.industry===i)
+            && (!w||r.dataset.wtp===w) && (!s||r.dataset.source===s) && (!n||r.dataset.new==='1')
+            && (!q||r.dataset.search.indexOf(q)>-1);
       r.style.display = ok ? '' : 'none';
       if(ok) shown++;
     }});
@@ -611,6 +763,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="fetch + prefilter only, no API cost")
     ap.add_argument("--no-open", action="store_true", help="do not open the dashboard in a browser")
     ap.add_argument("--reseed", action="store_true", help="re-fetch the frozen Reddit archive even if already seeded")
+    ap.add_argument("--no-web-search", action="store_true", help="competition check uses model knowledge only (no live web search)")
     ap.add_argument("--out", default="report.html", help="dashboard output path")
     ap.add_argument("--data", default=DATA_PATH, help="cross-run memory JSON path")
     args = ap.parse_args()
@@ -668,8 +821,11 @@ def main():
     if new_items:
         if not os.environ.get("ANTHROPIC_API_KEY"):
             sys.exit("ANTHROPIC_API_KEY not set. export it and retry (or use --dry-run).")
+        import anthropic
+        client = anthropic.Anthropic()   # one client, shared across classify + competition threads
         print(f"Classifying {len(new_items)} new items with {MODEL}...")
-        results = classify_all(new_items)
+        results = classify_all(client, new_items)
+        attach_competition(client, results, use_web=not args.no_web_search)
         merge_new(store, results, now)
     else:
         print("No new items to classify.")

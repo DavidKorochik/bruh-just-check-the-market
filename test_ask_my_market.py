@@ -109,6 +109,54 @@ def test_render_escapes_script_in_scraped_text():
     assert "<script>alert(1)</script>" not in out   # escaped, not injected
 
 
+def test_coerce_competition_validates_and_trims():
+    c = m._coerce_competition({"competition_level": "bogus", "competitors": ["A - x"] * 10,
+                              "confidence": "sky-high", "rationale": "r", "sanity_check": "s",
+                              "junk_key": "should be dropped"})
+    assert c["competition_level"] == "not_checked"           # invalid enum -> safe default
+    assert len(c["competitors"]) == 6                          # capped at 6
+    assert c["comp_confidence"] == "unknown"                   # invalid confidence -> unknown
+    assert set(c) == {"competition_level", "competitors", "comp_rationale", "comp_confidence", "comp_sanity"}
+    good = m._coerce_competition({"competition_level": "saturated", "competitors": [], "confidence": "high"})
+    assert good["competition_level"] == "saturated" and good["comp_confidence"] == "high"
+
+
+def test_default_competition_shape():
+    d = m._default_competition()
+    assert d["competition_level"] == "not_checked" and d["competitors"] == []
+
+
+def test_all_text_joins_blocks_around_tool_use():
+    # web search splits the answer across text blocks with tool blocks interleaved;
+    # _all_text must join ALL text blocks so the JSON (and cited competitor names) survives
+    class Blk:
+        def __init__(self, t, text=None):
+            self.type = t
+            if text is not None:
+                self.text = text
+
+    class Msg:
+        content = [Blk("text", '{"competition_level":"crow'),
+                   Blk("server_tool_use"),
+                   Blk("web_search_tool_result"),
+                   Blk("text", 'ded","competitors":["Clio"]}')]
+
+    assert m._all_text(Msg()) == '{"competition_level":"crowded","competitors":["Clio"]}'
+    assert m._extract_json(m._all_text(Msg()))["competition_level"] == "crowded"
+
+
+def test_render_shows_competition_and_filters():
+    rec = {"verdict": "worth_a_call", "fit_score": 90, "wtp_tier": "paying_a_human", "industry": "legal",
+           "pain": "p", "quote": "q", "where_they_gather": "r/law", "times_seen": 1,
+           "source_url": "https://reddit.com/x", "source_type": "reddit",
+           "competition_level": "saturated", "competitors": ["Clio - practice mgmt", "MyCase"],
+           "comp_rationale": "many strong incumbents", "comp_confidence": "high", "comp_sanity": "search agrees"}
+    out = m.render_html(_store(rec), {"fetched": 1, "new_count": 0, "new_urls": set()})
+    assert 'data-competition="saturated"' in out       # filterable
+    assert "Clio - practice mgmt" in out               # competitor visible (in tooltip)
+    assert 'id="fCompetition"' in out                  # filter control present
+
+
 def test_prefilter_dedups_and_balances_by_community():
     body = "a body with plenty of characters to clear the minimum length filter"
     items = []

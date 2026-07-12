@@ -27,7 +27,8 @@ dashboard to GitHub Pages - no live server, no running cost.
 
 ```
 load memory -> fetch (Reddit + HN) -> prefilter -> skip already-seen
-  -> Claude judgment (new items only) -> merge into memory -> render dashboard -> open
+  -> Claude judgment (new items only) -> competition check (web search, high-fit only)
+  -> merge into memory -> render dashboard -> open
 ```
 
 Two files do the work: [`ask_my_market.py`](./ask_my_market.py) (logic) and
@@ -87,6 +88,23 @@ signal an agent can take the job.
 | `worth_a_call` | >= 65     |
 | `watch`        | 40 - 64   |
 | `skip`         | < 40      |
+
+## Competition check (is the market already crowded?)
+
+A real pain that strong incumbents already serve is a trap, not an opportunity. So for every
+**high-fit** idea (`worth_a_call` / `watch` only - `skip`s are ignored to bound cost), the tool asks
+Claude to **live web-search** for existing products, then **sanity-check the search against its own
+prior knowledge** (and lower its confidence if they disagree). Each idea gets:
+
+- `competition_level`: `open_field` → `some_players` → `crowded` → `saturated`
+- the named `competitors` it found, a one-line rationale, and a confidence
+
+This is **flag-only** - it never changes `fit_score` or `verdict`. It shows up as a color-coded
+`competition` column (green = open field, red = saturated), a filter, and a **"worth a call + open
+lane"** summary card (high-fit ideas that are *not* crowded - your best shots). Results are cached in
+memory, so each idea is researched once. Turn it off with `--no-web-search` (falls back to model
+knowledge; also the automatic fallback if a search errors). Cost: web search is ~$10/1k searches, so a
+seed run's high-fit set adds well under $1; incremental runs add pennies.
 
 ## A note on the Reddit source (the "GummySearch lesson")
 
