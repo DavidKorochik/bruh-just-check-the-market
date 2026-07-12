@@ -53,16 +53,22 @@ Useful flags: `--limit N` (max NEW items classified), `--data PATH` (memory file
 
 One-time setup:
 
-1. **Add your API key as a repo secret** (uploads your key to *your* repo's secrets):
+1. **Add your Anthropic API key as a secret:**
    ```bash
    gh secret set ANTHROPIC_API_KEY --repo DavidKorochik/bruh-just-check-the-market
    ```
-2. **Turn on Pages -> GitHub Actions** (Settings -> Pages -> Source: GitHub Actions), or:
+2. **Add Reddit OAuth creds** (required in CI - reddit blocks anonymous reads from GitHub's IPs).
+   Create a free app at <https://www.reddit.com/prefs/apps> → "create app" → type **script** →
+   redirect URI `http://localhost`. The client id is under the app name; the secret is labeled "secret":
+   ```bash
+   gh secret set REDDIT_CLIENT_ID     --repo DavidKorochik/bruh-just-check-the-market
+   gh secret set REDDIT_CLIENT_SECRET --repo DavidKorochik/bruh-just-check-the-market
+   ```
+3. **Turn on Pages -> GitHub Actions** (Settings -> Pages -> Source: GitHub Actions), or:
    ```bash
    gh api -X POST repos/DavidKorochik/bruh-just-check-the-market/pages -f build_type=workflow
    ```
-3. **Kick off the first run** (populates the memory + dashboard; ~166 RSS fetches + classification,
-   a few minutes):
+4. **Kick off the first run** (~a few minutes):
    ```bash
    gh workflow run scan.yml
    ```
@@ -106,14 +112,16 @@ seed run's high-fit set adds well under $1; incremental runs add pennies.
 
 ## A note on the Reddit source (the "GummySearch lesson")
 
-Reddit fights bulk reads. The public `.json` API `403`s flagged/datacenter IPs, and
-[pullpush.io](https://pullpush.io) (a no-auth Pushshift successor) `429`s hard from datacenter IPs
-like GitHub's runners - a full query sweep gets rate-limited into the ground. So the tool reads each
-subreddit's **RSS `/new` feed** instead: **one request per sub** (166 vs ~500), *fresh* (not a stale
-archive), and it returns `200` from the same IPs where `.json` and pullpush fail. RSS has no
-server-side query, so the tool keeps only posts with pay-signal language (`PAY_SIGNAL_KEYWORDS`)
-before classifying. pullpush stays as a per-sub fallback. XML is parsed with `defusedxml` (untrusted
-input). One source failing never kills a run.
+Reddit fights bulk reads, and it blocks **GitHub's runner IPs on every anonymous endpoint** -
+`.json` `403`s, RSS `429`s, pullpush `429`s. So the hosted scan uses the **authenticated OAuth API**
+(`oauth.reddit.com`), which is rate-limited per *account*, not per IP, and works from anywhere. The
+tool **auto-selects** its backend:
+
+- **OAuth** when `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET` are set (CI) - restores server-side pay-signal query search.
+- **RSS `/new`** when they're not (a local run from a residential IP, which reddit doesn't block) - unfiltered recent, filtered locally by `PAY_SIGNAL_KEYWORDS`.
+- **pullpush.io** as a last-ditch per-sub fallback.
+
+XML (RSS) is parsed with `defusedxml` (untrusted input). One source failing never kills a run.
 
 ## Tests
 

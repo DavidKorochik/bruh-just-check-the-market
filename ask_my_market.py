@@ -47,7 +47,7 @@ from pathlib import Path
 import defusedxml.ElementTree as ET   # XXE / billion-laughs-safe parser for untrusted RSS
 import requests
 
-from industries import HN_QUERIES, INDUSTRIES
+from industries import BASE_QUERIES, HN_QUERIES, INDUSTRIES
 
 # =============================================================================
 # CONFIG  -  edit freely (industries.py holds the sector/subreddit/query taxonomy)
@@ -84,6 +84,7 @@ WATCH_AT = 40          # >= this -> watch, else skip
 
 # --- Fetch / cost knobs ---------------------------------------------------
 MAX_ITEMS = 200            # cap on how many NEW survivors get classified per run
+QUERIES_PER_SUB = 3        # pay-signal queries per sub when using the Reddit OAuth search API
 REDDIT_PAGE = 25
 HN_PAGE = 25
 REDDIT_SLEEP = 1.0        # polite pause between reddit calls
@@ -91,7 +92,7 @@ CLASSIFY_WORKERS = 5
 BODY_TRUNC = 1500
 MIN_CHARS = 40
 HTTP_TIMEOUT = 30
-USER_AGENT = "ask-my-market/0.2 (personal customer-discovery tool; contact u/DavidKorochik)"
+USER_AGENT = "python:ask-my-market:0.3 (by /u/DavidKorochik)"   # reddit requires a unique descriptive UA
 
 DATA_PATH = "data/findings.json"   # cross-run memory (committed by the Action)
 
@@ -180,33 +181,82 @@ def _strip_html(text):
 
 
 def fetch_reddit(industries, sample=False):
-    """Reddit across the whole taxonomy via each sub's RSS /new feed: ONE request per sub,
-    fresh, and datacenter-tolerant (RSS returns 200 from IPs where .json 403s and pullpush
-    429s). pullpush.io is a per-sub fallback. RSS is unfiltered recent, so keep only posts
-    with pay-signal language before classifying."""
+    """Reddit across the taxonomy, with a backend that AUTO-SELECTS by environment:
+
+    - OAuth API (REDDIT_CLIENT_ID/SECRET set): authenticated, so it works from ANY IP -
+      required in CI, where reddit blocks anonymous requests from datacenter IPs. Restores
+      server-side pay-signal query search.
+    - RSS /new (no creds, e.g. a local run from a residential IP): one request per sub,
+      unfiltered recent -> filtered locally for pay-signal language.
+    - pullpush.io: last-ditch per-sub fallback.
+    """
+    token = _reddit_token()
+    print(f"  [reddit] backend: {'OAuth API (authenticated)' if token else 'RSS /new (anonymous)'}")
     sectors = industries[:2] if sample else industries
+    n = 2 if sample else QUERIES_PER_SUB
     items = []
     for sec in sectors:
         subs = sec["subreddits"][:1] if sample else sec["subreddits"]
+        queries = (sec.get("queries", [])[:1] + BASE_QUERIES)[:n]
         for sub in subs:
-            name = sub["name"]
-            try:
-                items.extend(_reddit_rss(name))
-            except Exception as e:
-                print(f"  [reddit] r/{name} rss failed ({e}); trying pullpush", file=sys.stderr)
-                try:
-                    items.extend(_reddit_pullpush(name, None))
-                except Exception as e2:
-                    print(f"  [reddit] r/{name} pullpush also failed: {e2}", file=sys.stderr)
-            time.sleep(REDDIT_SLEEP)
-    kept = [it for it in items if _has_pay_signal(it)]
-    print(f"  [reddit] {len(items)} recent posts -> {len(kept)} with pay-signal language")
-    return kept
+            items.extend(_fetch_one_sub(sub["name"], token, queries))
+    return items
+
+
+def _fetch_one_sub(name, token, queries):
+    """OAuth query-search (already pay-signal) -> RSS /new + local filter -> pullpush + filter."""
+    if token:
+        try:
+            out = []
+            for q in queries:
+                out.extend(_reddit_oauth_search(name, q, token))
+                time.sleep(REDDIT_SLEEP)
+            return out
+        except Exception as e:
+            print(f"  [reddit] r/{name} oauth failed ({e}); trying rss", file=sys.stderr)
+    try:
+        rows = _reddit_rss(name)
+        time.sleep(REDDIT_SLEEP)
+        return [it for it in rows if _has_pay_signal(it)]
+    except Exception as e:
+        print(f"  [reddit] r/{name} rss failed ({e}); trying pullpush", file=sys.stderr)
+    try:
+        return [it for it in _reddit_pullpush(name, None) if _has_pay_signal(it)]
+    except Exception as e:
+        print(f"  [reddit] r/{name} pullpush failed: {e}", file=sys.stderr)
+        return []
 
 
 def _has_pay_signal(item):
     blob = " " + (item["title"] + " " + item["body"]).lower() + " "
     return any(k in blob for k in PAY_SIGNAL_KEYWORDS)
+
+
+def _reddit_token():
+    """Application-only OAuth (client_credentials). Returns a bearer token, or None if no
+    creds / it fails - the caller then falls back to anonymous RSS."""
+    cid, secret = os.environ.get("REDDIT_CLIENT_ID"), os.environ.get("REDDIT_CLIENT_SECRET")
+    if not (cid and secret):
+        return None
+    try:
+        r = requests.post("https://www.reddit.com/api/v1/access_token",
+                          auth=(cid, secret), data={"grant_type": "client_credentials"},
+                          headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        return r.json().get("access_token")
+    except Exception as e:
+        print(f"  [reddit] OAuth token request failed ({e}); using anonymous", file=sys.stderr)
+        return None
+
+
+def _reddit_oauth_search(sub, query, token):
+    """Authenticated in-subreddit search via oauth.reddit.com (works from any IP)."""
+    r = requests.get(f"https://oauth.reddit.com/r/{sub}/search",
+                     params={"q": query, "restrict_sr": 1, "sort": "new", "limit": REDDIT_PAGE, "type": "link"},
+                     headers={"Authorization": f"bearer {token}", "User-Agent": USER_AGENT},
+                     timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return [_reddit_row(c.get("data", {})) for c in r.json().get("data", {}).get("children", [])]
 
 
 _ATOM = "{http://www.w3.org/2005/Atom}"

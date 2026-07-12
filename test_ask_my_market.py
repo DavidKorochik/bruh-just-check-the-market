@@ -130,6 +130,26 @@ def test_parse_reddit_rss():
     assert it["created"] == "2026-07-12"
 
 
+def test_reddit_token_none_without_creds():
+    import os
+    saved = {k: os.environ.pop(k, None) for k in ("REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET")}
+    try:
+        assert m._reddit_token() is None   # no creds -> None, no network call
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_reddit_row_parses_child_data():
+    d = {"title": "t", "selftext": "body", "permalink": "/r/x/comments/1/t/",
+         "subreddit": "x", "created_utc": 1700000000}
+    it = m._reddit_row(d)
+    assert it["source_type"] == "reddit" and it["where"] == "r/x"
+    assert it["url"] == "https://www.reddit.com/r/x/comments/1/t/"
+    assert it["title"] == "t" and it["body"] == "body" and it["created"] == "2023-11-14"
+
+
 def test_has_pay_signal():
     yes = m.make_item("reddit", "u", "I hired a VA to do this all day", "", "u", "r/x", "")
     also = m.make_item("reddit", "u", "cute cat", "spend hours categorizing receipts by hand", "u", "r/x", "")
