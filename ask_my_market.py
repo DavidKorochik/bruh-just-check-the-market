@@ -144,6 +144,13 @@ def _now():
 # source never kills a run.
 # =============================================================================
 
+# One session reused across all ~500 sequential fetch requests (connection reuse - avoids a
+# fresh TLS handshake per call - and sets the UA reddit requires once as a default header).
+# Fetch is single-threaded, so sharing a Session is safe (classification/competition use the
+# Anthropic client, not this session).
+_SESSION = requests.Session()
+_SESSION.headers["User-Agent"] = USER_AGENT
+
 
 def fetch_hn(queries):
     """Hacker News via Algolia. Zero auth, clean JSON, fresh. Stories + comments."""
@@ -152,8 +159,8 @@ def fetch_hn(queries):
     for q in queries:
         for tag in ("story", "comment"):
             try:
-                r = requests.get(base, params={"query": q, "tags": tag, "hitsPerPage": HN_PAGE},
-                                 headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+                r = _SESSION.get(base, params={"query": q, "tags": tag, "hitsPerPage": HN_PAGE},
+                                 timeout=HTTP_TIMEOUT)
                 r.raise_for_status()
                 hits = r.json().get("hits", [])
             except Exception as e:
@@ -204,16 +211,19 @@ def fetch_reddit(industries, sample=False):
 
 
 def _fetch_one_sub(name, token, queries):
-    """OAuth query-search (already pay-signal) -> RSS /new + local filter -> pullpush + filter."""
+    """With a token (CI): use ONLY the OAuth API. Each query is isolated so one failure keeps the
+    others' results, and there is NO anonymous fallback - RSS/pullpush 403/429 from CI IPs, so
+    falling back per-sub would just burn ~28s/sub of backoff toward the job timeout for nothing.
+    Without a token (local/residential run): RSS /new -> pullpush, both pay-signal-filtered."""
     if token:
-        try:
-            out = []
-            for q in queries:
+        out = []
+        for q in queries:
+            try:
                 out.extend(_reddit_oauth_search(name, q, token))
-                time.sleep(REDDIT_SLEEP)
-            return out
-        except Exception as e:
-            print(f"  [reddit] r/{name} oauth failed ({e}); trying rss", file=sys.stderr)
+            except Exception as e:
+                print(f"  [reddit] r/{name} q={q!r} oauth failed ({e})", file=sys.stderr)
+            time.sleep(REDDIT_SLEEP)
+        return out
     try:
         rows = _reddit_rss(name)
         time.sleep(REDDIT_SLEEP)
@@ -235,13 +245,16 @@ def _has_pay_signal(item):
 def _reddit_token():
     """Application-only OAuth (client_credentials). Returns a bearer token, or None if no
     creds / it fails - the caller then falls back to anonymous RSS."""
-    cid, secret = os.environ.get("REDDIT_CLIENT_ID"), os.environ.get("REDDIT_CLIENT_SECRET")
+    # strip: a trailing newline/space from pasting a secret into the GitHub UI otherwise
+    # produces a silent 401 invalid_client, indistinguishable from "no creds configured".
+    cid = (os.environ.get("REDDIT_CLIENT_ID") or "").strip()
+    secret = (os.environ.get("REDDIT_CLIENT_SECRET") or "").strip()
     if not (cid and secret):
         return None
     try:
-        r = requests.post("https://www.reddit.com/api/v1/access_token",
+        r = _SESSION.post("https://www.reddit.com/api/v1/access_token",
                           auth=(cid, secret), data={"grant_type": "client_credentials"},
-                          headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+                          timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         return r.json().get("access_token")
     except Exception as e:
@@ -250,11 +263,22 @@ def _reddit_token():
 
 
 def _reddit_oauth_search(sub, query, token):
-    """Authenticated in-subreddit search via oauth.reddit.com (works from any IP)."""
-    r = requests.get(f"https://oauth.reddit.com/r/{sub}/search",
-                     params={"q": query, "restrict_sr": 1, "sort": "new", "limit": REDDIT_PAGE, "type": "link"},
-                     headers={"Authorization": f"bearer {token}", "User-Agent": USER_AGENT},
-                     timeout=HTTP_TIMEOUT)
+    """Authenticated in-subreddit search via oauth.reddit.com (works from any IP). Retries on
+    429 (honoring x-ratelimit-reset) and 5xx - OAuth is ~100 QPM. raw_json=1 stops reddit
+    HTML-encoding entities (&amp;, &#39;) in titles/bodies."""
+    url = f"https://oauth.reddit.com/r/{sub}/search"
+    params = {"q": query, "restrict_sr": 1, "sort": "new", "limit": REDDIT_PAGE,
+              "type": "link", "raw_json": 1}
+    headers = {"Authorization": f"bearer {token}"}
+    r = None
+    for delay in (0, 3, 8):
+        if delay:
+            time.sleep(delay)
+        r = _SESSION.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+        if r.status_code != 429 and r.status_code < 500:
+            break
+        if r.status_code == 429:
+            time.sleep(min(float(r.headers.get("x-ratelimit-reset", 0) or 0), 15))
     r.raise_for_status()
     return [_reddit_row(c.get("data", {})) for c in r.json().get("data", {}).get("children", [])]
 
@@ -269,8 +293,7 @@ def _reddit_rss(sub):
     for delay in (0, 3, 8):
         if delay:
             time.sleep(delay)
-        r = requests.get(url, params={"limit": REDDIT_PAGE},
-                         headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+        r = _SESSION.get(url, params={"limit": REDDIT_PAGE}, timeout=HTTP_TIMEOUT)
         if r.status_code != 429:
             break
     r.raise_for_status()
@@ -303,8 +326,8 @@ def _reddit_pullpush(sub, query):
     for delay in (0, 2, 5, 10):  # first try, then escalating backoff on 429
         if delay:
             time.sleep(delay)
-        r = requests.get("https://api.pullpush.io/reddit/search/submission/",
-                         params=params, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+        r = _SESSION.get("https://api.pullpush.io/reddit/search/submission/",
+                         params=params, timeout=HTTP_TIMEOUT)
         if r.status_code != 429:
             break
     r.raise_for_status()

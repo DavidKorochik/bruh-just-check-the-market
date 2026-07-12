@@ -141,6 +141,31 @@ def test_reddit_token_none_without_creds():
                 os.environ[k] = v
 
 
+def test_fetch_one_sub_oauth_isolates_queries_and_skips_fallback():
+    calls = {"oauth": 0, "rss": 0}
+
+    def fake_oauth(sub, q, token):
+        calls["oauth"] += 1
+        if q == "boom":
+            raise RuntimeError("429 Too Many Requests")
+        return [m.make_item("reddit", f"{sub}-{q}", "t", "b", "u", "r/" + sub, "")]
+
+    def fake_rss(sub):
+        calls["rss"] += 1
+        return []
+
+    orig = (m._reddit_oauth_search, m._reddit_rss, m.REDDIT_SLEEP)
+    m._reddit_oauth_search, m._reddit_rss, m.REDDIT_SLEEP = fake_oauth, fake_rss, 0
+    try:
+        out = m._fetch_one_sub("msp", "tok", ["good", "boom", "good2"])
+    finally:
+        m._reddit_oauth_search, m._reddit_rss, m.REDDIT_SLEEP = orig
+
+    assert calls["oauth"] == 3   # every query attempted (one bad query doesn't abort the loop)
+    assert calls["rss"] == 0     # token present -> NO anonymous fallback (would 429 in CI + burn timeout)
+    assert len(out) == 2         # partial results from the 2 good queries are kept
+
+
 def test_reddit_row_parses_child_data():
     d = {"title": "t", "selftext": "body", "permalink": "/r/x/comments/1/t/",
          "subreddit": "x", "created_utc": 1700000000}
