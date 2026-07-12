@@ -108,7 +108,7 @@ def make_item(source_type, item_id, title, body, url, where, created_iso):
 
 def _iso(ts):
     try:
-        return dt.datetime.fromtimestamp(float(ts), dt.UTC).date().isoformat()
+        return dt.datetime.fromtimestamp(float(ts), dt.timezone.utc).date().isoformat()
     except Exception:
         return ""
 
@@ -169,7 +169,7 @@ def fetch_reddit(subreddits, queries):
     block (403) falls back to pullpush.io for the whole run. This is the
     source-resilience the roadmap calls for: one source failing never kills it.
     """
-    use_official = _reddit_official_works()
+    use_official = _reddit_official_works(subreddits[0]) if subreddits else False
     backend = "official reddit .json" if use_official else "pullpush.io archive"
     print(f"  [reddit] backend: {backend}")
 
@@ -188,11 +188,13 @@ def fetch_reddit(subreddits, queries):
     return items
 
 
-def _reddit_official_works():
-    """Probe once. Reddit blocks datacenter/flagged IPs with 403 + HTML page."""
+def _reddit_official_works(sub):
+    """Probe once, against a REAL configured sub. Reddit blocks datacenter/flagged IPs
+    with 403 + HTML page; probing a sub the user actually wants avoids a false
+    'blocked' downgrade to the stale archive keyed off a hardcoded subreddit."""
     try:
         r = requests.get(
-            "https://www.reddit.com/r/msp/new.json?limit=1",
+            f"https://www.reddit.com/r/{sub}/new.json?limit=1",
             headers={"User-Agent": USER_AGENT},
             timeout=HTTP_TIMEOUT,
         )
@@ -449,6 +451,14 @@ def classify_all(items):
 VERDICT_COLOR = {"worth_a_call": "#1a7f37", "watch": "#b7791f", "skip": "#6b7280"}
 
 
+def _safe_href(url):
+    """Allow ONLY http(s). Scraped/archived posts can carry a `url` field with a
+    javascript: or data: scheme; html.escape does not block those, and the report
+    auto-opens in a browser. Returns "" for anything not plainly http(s)."""
+    url = (url or "").strip()
+    return url if url.lower().startswith(("http://", "https://")) else ""
+
+
 def render_html(results, fetched_count, kept_count):
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     counts = {"worth_a_call": 0, "watch": 0, "skip": 0}
@@ -458,8 +468,11 @@ def render_html(results, fetched_count, kept_count):
     rows = []
     for r in results:
         color = VERDICT_COLOR.get(r["verdict"], "#6b7280")
-        link = html.escape(r["source_url"] or "")
+        href = _safe_href(r["source_url"])
         src = html.escape(r["source_type"])
+        # scheme allow-list + attribute escape (defense in depth); plain text if unsafe
+        source_cell = (f'<a href="{html.escape(href)}" target="_blank" rel="noopener">{src} &#8599;</a>'
+                       if href else src)
         rows.append(f"""
       <tr class="v-{r['verdict']}">
         <td class="num">{r['fit_score']}</td>
@@ -468,7 +481,7 @@ def render_html(results, fetched_count, kept_count):
         <td>{html.escape(r['pain'])}</td>
         <td class="quote">{html.escape(r['quote'])}</td>
         <td>{html.escape(r['where_they_gather'])}</td>
-        <td><a href="{link}" target="_blank" rel="noopener">{src} &#8599;</a></td>
+        <td>{source_cell}</td>
       </tr>""")
 
     return f"""<!DOCTYPE html>

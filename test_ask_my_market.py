@@ -48,6 +48,24 @@ def test_coerce_validates_boundary():
     assert c["judgment_on_stream"] is True  # truthy string coerced to bool
 
 
+def test_safe_href_blocks_dangerous_schemes():
+    assert m._safe_href("https://reddit.com/x") == "https://reddit.com/x"
+    assert m._safe_href("http://news.ycombinator.com/item?id=1") == "http://news.ycombinator.com/item?id=1"
+    assert m._safe_href("javascript:alert(1)") == ""      # XSS scheme -> dropped
+    assert m._safe_href("data:text/html,<script>") == ""  # data scheme -> dropped
+    assert m._safe_href("  JavaScript:alert(1)") == ""     # trimmed + case-insensitive
+    assert m._safe_href("") == "" and m._safe_href(None) == ""
+
+
+def test_render_drops_unsafe_link_but_keeps_row():
+    rec = {"verdict": "worth_a_call", "fit_score": 90, "wtp_tier": "paying_a_human",
+           "pain": "p", "quote": "q", "where_they_gather": "r/x",
+           "source_url": "javascript:alert(document.cookie)", "source_type": "reddit"}
+    out = m.render_html([rec], 1, 1)
+    assert "javascript:alert" not in out   # never reaches the HTML
+    assert "worth_a_call" in out           # row still rendered
+
+
 def test_prefilter_dedups_and_balances():
     body = "a body with plenty of characters to clear the minimum length filter"
     items = []
