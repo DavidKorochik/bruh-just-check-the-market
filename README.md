@@ -42,7 +42,6 @@ pip install -r requirements.txt
 export ANTHROPIC_API_KEY=sk-ant-...
 
 python ask_my_market.py                 # incremental run -> writes + opens report.html
-python ask_my_market.py --reseed        # re-pull the frozen Reddit archive (full seed)
 python ask_my_market.py --dry-run       # fetch + prefilter only, zero API cost
 python ask_my_market.py --sample --limit 20   # fast smoke test (tiny source subset)
 ```
@@ -62,9 +61,8 @@ One-time setup:
    ```bash
    gh api -X POST repos/DavidKorochik/bruh-just-check-the-market/pages -f build_type=workflow
    ```
-3. **Seed the memory once.** The first run is the slow one (it grinds through pullpush rate-limits
-   across 166 subs). Either run `python ask_my_market.py --reseed` locally and commit
-   `data/findings.json`, or trigger the Action once:
+3. **Kick off the first run** (populates the memory + dashboard; ~166 RSS fetches + classification,
+   a few minutes):
    ```bash
    gh workflow run scan.yml
    ```
@@ -108,12 +106,14 @@ seed run's high-fit set adds well under $1; incremental runs add pennies.
 
 ## A note on the Reddit source (the "GummySearch lesson")
 
-Reddit's public `.json` now hard-blocks flagged IPs with a `403`. The tool probes the official
-endpoint first and **falls back to [pullpush.io](https://pullpush.io)** (a no-auth Pushshift
-successor) when blocked. pullpush is a *queryable archive* (its index lags ~1 year), so Reddit
-findings are older but still valid pain; Hacker News carries the fresh signal. Because runs
-accumulate, the frozen archive is seeded once and then skipped - incremental runs lean on HN.
-One source failing never kills a run.
+Reddit fights bulk reads. The public `.json` API `403`s flagged/datacenter IPs, and
+[pullpush.io](https://pullpush.io) (a no-auth Pushshift successor) `429`s hard from datacenter IPs
+like GitHub's runners - a full query sweep gets rate-limited into the ground. So the tool reads each
+subreddit's **RSS `/new` feed** instead: **one request per sub** (166 vs ~500), *fresh* (not a stale
+archive), and it returns `200` from the same IPs where `.json` and pullpush fail. RSS has no
+server-side query, so the tool keeps only posts with pay-signal language (`PAY_SIGNAL_KEYWORDS`)
+before classifying. pullpush stays as a per-sub fallback. XML is parsed with `defusedxml` (untrusted
+input). One source failing never kills a run.
 
 ## Tests
 

@@ -109,6 +109,34 @@ def test_render_escapes_script_in_scraped_text():
     assert "<script>alert(1)</script>" not in out   # escaped, not injected
 
 
+def test_parse_reddit_rss():
+    xml = '''<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Paying someone to reconcile invoices - worth it?</title>
+    <link href="https://www.reddit.com/r/Bookkeeping/comments/abc/x/"/>
+    <content type="html">&lt;p&gt;I spend hours every week on this.&lt;/p&gt;</content>
+    <id>t3_abc</id>
+    <updated>2026-07-12T10:00:00+00:00</updated>
+  </entry>
+</feed>'''
+    items = m._parse_reddit_rss(xml, "Bookkeeping")
+    assert len(items) == 1
+    it = items[0]
+    assert it["source_type"] == "reddit" and it["where"] == "r/Bookkeeping"
+    assert it["url"].endswith("/x/")
+    assert "reconcile invoices" in it["title"]
+    assert "spend hours" in it["body"].lower()   # HTML stripped + entities unescaped
+    assert it["created"] == "2026-07-12"
+
+
+def test_has_pay_signal():
+    yes = m.make_item("reddit", "u", "I hired a VA to do this all day", "", "u", "r/x", "")
+    also = m.make_item("reddit", "u", "cute cat", "spend hours categorizing receipts by hand", "u", "r/x", "")
+    no = m.make_item("reddit", "u", "Look at my cat photo", "just a cat, nothing else", "u", "r/x", "")
+    assert m._has_pay_signal(yes) and m._has_pay_signal(also) and not m._has_pay_signal(no)
+
+
 def test_coerce_competition_validates_and_trims():
     c = m._coerce_competition({"competition_level": "bogus", "competitors": ["A - x"] * 10,
                               "confidence": "sky-high", "rationale": "r", "sanity_check": "s",

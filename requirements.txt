@@ -1,2 +1,3 @@
 requests>=2.31
 anthropic>=0.40
+defusedxml>=0.7

@@ -18,14 +18,17 @@ and tracks frequency-over-time, and a redesigned filterable dashboard suitable
 for hosting on GitHub Pages via a scheduled Action.
 
 Pipeline:
-    load memory -> fetch (Reddit + HN) -> prefilter -> skip already-seen
-    -> Claude judgment (new only) -> merge into memory -> render dashboard -> open
+    load memory -> fetch (Reddit RSS + HN) -> prefilter -> skip already-seen
+    -> Claude judgment (new only) -> competition web-search (high-fit) -> merge -> dashboard
+
+Reddit is read via each subreddit's RSS /new feed (one request per sub, fresh, and
+datacenter-tolerant where the .json API 403s and pullpush 429s); pullpush.io is a fallback.
 
 Run:
     export ANTHROPIC_API_KEY=...
-    python ask_my_market.py                     # incremental run
-    python ask_my_market.py --reseed            # re-pull the frozen Reddit archive
+    python ask_my_market.py                     # scan -> classify new -> dashboard
     python ask_my_market.py --dry-run --sample  # fetch only, no API cost
+    python ask_my_market.py --no-web-search     # skip the live competition web search
 """
 
 from __future__ import annotations
@@ -41,9 +44,10 @@ import time
 import webbrowser
 from pathlib import Path
 
+import defusedxml.ElementTree as ET   # XXE / billion-laughs-safe parser for untrusted RSS
 import requests
 
-from industries import BASE_QUERIES, HN_QUERIES, INDUSTRIES
+from industries import HN_QUERIES, INDUSTRIES
 
 # =============================================================================
 # CONFIG  -  edit freely (industries.py holds the sector/subreddit/query taxonomy)
@@ -80,8 +84,6 @@ WATCH_AT = 40          # >= this -> watch, else skip
 
 # --- Fetch / cost knobs ---------------------------------------------------
 MAX_ITEMS = 200            # cap on how many NEW survivors get classified per run
-QUERIES_PER_SUB = 3        # pay-signal queries fired per subreddit (bounds pullpush volume:
-                           # 166 subs x this many calls; keep modest or the seed run crawls)
 REDDIT_PAGE = 25
 HN_PAGE = 25
 REDDIT_SLEEP = 1.0        # polite pause between reddit calls
@@ -92,6 +94,18 @@ HTTP_TIMEOUT = 30
 USER_AGENT = "ask-my-market/0.2 (personal customer-discovery tool; contact u/DavidKorochik)"
 
 DATA_PATH = "data/findings.json"   # cross-run memory (committed by the Action)
+
+# Reddit RSS /new is unfiltered recent posts (no server-side query), so we filter
+# locally for pay-signal / manual-judgment language before spending classification.
+PAY_SIGNAL_KEYWORDS = [
+    "paying someone", "pay someone", "paid someone", "hired", "hire someone", "hire a",
+    " va ", "virtual assistant", "freelancer", "outsource", "assistant to", "someone to",
+    "wish there was", "why is there no", "is there a tool", "is there any tool", "any software",
+    "spend hours", "hours every", "hours a day", "so much time", "waste of time", "time-consuming",
+    "by hand", "manually", "manual process", "tedious", "keep track of", "keeping track",
+    "reconcile", "reconciling", "chase ", "chasing", "triage", "categorize", "categorise",
+    "monitor", "monitoring", "reviewing every", "one by one", "every single",
+]
 
 # Short industry labels the model is nudged toward (free-text, but consistent).
 SECTOR_HINTS = sorted({i["sector"] for i in INDUSTRIES})
@@ -165,49 +179,68 @@ def _strip_html(text):
     return html.unescape(re.sub(r"<[^>]+>", " ", text))
 
 
-def fetch_reddit(industries, use_official, sample=False):
-    """Reddit across the whole industry taxonomy. Official public JSON first
-    (fresh, works from un-blocked IPs), else pullpush.io archive fallback."""
+def fetch_reddit(industries, sample=False):
+    """Reddit across the whole taxonomy via each sub's RSS /new feed: ONE request per sub,
+    fresh, and datacenter-tolerant (RSS returns 200 from IPs where .json 403s and pullpush
+    429s). pullpush.io is a per-sub fallback. RSS is unfiltered recent, so keep only posts
+    with pay-signal language before classifying."""
     sectors = industries[:2] if sample else industries
     items = []
     for sec in sectors:
         subs = sec["subreddits"][:1] if sample else sec["subreddits"]
-        # Per sub: a few TARGETED pay-signal queries (sector-specific first, then universal),
-        # bounded by QUERIES_PER_SUB - 166 subs x many queries would be thousands of
-        # rate-limited pullpush calls, and we only classify MAX_ITEMS anyway.
-        n = 2 if sample else QUERIES_PER_SUB
-        queries = (sec.get("queries", [])[:1] + BASE_QUERIES)[:n]
         for sub in subs:
             name = sub["name"]
-            for q in queries:
+            try:
+                items.extend(_reddit_rss(name))
+            except Exception as e:
+                print(f"  [reddit] r/{name} rss failed ({e}); trying pullpush", file=sys.stderr)
                 try:
-                    rows = (_reddit_official(name, q) if use_official else _reddit_pullpush(name, q))
-                    items.extend(rows)
-                except Exception as e:
-                    print(f"  [reddit] r/{name} q={q!r} failed: {e}", file=sys.stderr)
-                time.sleep(REDDIT_SLEEP)
-    return items
+                    items.extend(_reddit_pullpush(name, None))
+                except Exception as e2:
+                    print(f"  [reddit] r/{name} pullpush also failed: {e2}", file=sys.stderr)
+            time.sleep(REDDIT_SLEEP)
+    kept = [it for it in items if _has_pay_signal(it)]
+    print(f"  [reddit] {len(items)} recent posts -> {len(kept)} with pay-signal language")
+    return kept
 
 
-def _reddit_official_works(sub):
-    """Probe once against a REAL configured sub. Reddit blocks flagged IPs with 403."""
-    try:
-        r = requests.get(f"https://www.reddit.com/r/{sub}/new.json?limit=1",
+def _has_pay_signal(item):
+    blob = " " + (item["title"] + " " + item["body"]).lower() + " "
+    return any(k in blob for k in PAY_SIGNAL_KEYWORDS)
+
+
+_ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+def _reddit_rss(sub):
+    """Fetch + parse a subreddit's Atom /new feed. Short backoff if the CDN 429s."""
+    url = f"https://www.reddit.com/r/{sub}/new/.rss"
+    r = None
+    for delay in (0, 3, 8):
+        if delay:
+            time.sleep(delay)
+        r = requests.get(url, params={"limit": REDDIT_PAGE},
                          headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
-        return r.status_code == 200 and r.headers.get("content-type", "").startswith("application/json")
-    except Exception:
-        return False
-
-
-def _reddit_official(sub, query):
-    if query is None:
-        url, params = f"https://www.reddit.com/r/{sub}/new.json", {"limit": REDDIT_PAGE}
-    else:
-        url = f"https://www.reddit.com/r/{sub}/search.json"
-        params = {"q": query, "restrict_sr": 1, "sort": "new", "limit": REDDIT_PAGE}
-    r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+        if r.status_code != 429:
+            break
     r.raise_for_status()
-    return [_reddit_row(c.get("data", {})) for c in r.json().get("data", {}).get("children", [])]
+    return _parse_reddit_rss(r.text, sub)
+
+
+def _parse_reddit_rss(xml_text, sub):
+    """Reddit /new.rss is Atom. Pull title, permalink, body (HTML content), id, date."""
+    root = ET.fromstring(xml_text)
+    out = []
+    for e in root.findall(f"{_ATOM}entry"):
+        title = e.findtext(f"{_ATOM}title", default="")
+        content = e.findtext(f"{_ATOM}content", default="")
+        eid = e.findtext(f"{_ATOM}id", default="")
+        updated = (e.findtext(f"{_ATOM}updated", default="") or "")[:10]
+        link_el = e.find(f"{_ATOM}link")
+        url = link_el.get("href") if link_el is not None else ""
+        out.append(make_item("reddit", url or eid, title, _strip_html(content),
+                             url, "r/" + sub, updated))
+    return out
 
 
 def _reddit_pullpush(sub, query):
@@ -762,45 +795,23 @@ def main():
     ap.add_argument("--sample", action="store_true", help="tiny source subset for a fast smoke test")
     ap.add_argument("--dry-run", action="store_true", help="fetch + prefilter only, no API cost")
     ap.add_argument("--no-open", action="store_true", help="do not open the dashboard in a browser")
-    ap.add_argument("--reseed", action="store_true", help="re-fetch the frozen Reddit archive even if already seeded")
     ap.add_argument("--no-web-search", action="store_true", help="competition check uses model knowledge only (no live web search)")
     ap.add_argument("--out", default="report.html", help="dashboard output path")
     ap.add_argument("--data", default=DATA_PATH, help="cross-run memory JSON path")
     args = ap.parse_args()
 
     store = load_store(args.data)
-    already_seeded = bool(store["_meta"].get("reddit_seeded"))
-
-    print("Probing Reddit backend...")
-    first_sub = INDUSTRIES[0]["subreddits"][0]["name"] if INDUSTRIES else "msp"
-    use_official = _reddit_official_works(first_sub)
-    print(f"  reddit backend: {'official .json (fresh)' if use_official else 'pullpush.io archive (frozen)'}")
-
-    # Skip re-pulling the FROZEN archive on scheduled incremental runs (it returns
-    # identical data + hammers a rate-limited API). Fresh official backend never skips.
-    skip_reddit = already_seeded and (not use_official) and (not args.reseed)
 
     print("Fetching...")
     raw = []
-    try:
-        hn = fetch_hn(HN_QUERIES[:1] if args.sample else HN_QUERIES)
-        print(f"  fetched {len(hn)} from hackernews")
-        raw.extend(hn)
-    except Exception as e:
-        print(f"  [hackernews] source failed entirely: {e}", file=sys.stderr)
-    if skip_reddit:
-        print("  [reddit] archive already seeded (frozen); skipping. Use --reseed to refetch.")
-    else:
+    for name, fn in [("hackernews", lambda: fetch_hn(HN_QUERIES[:1] if args.sample else HN_QUERIES)),
+                     ("reddit", lambda: fetch_reddit(INDUSTRIES, sample=args.sample))]:
         try:
-            rd = fetch_reddit(INDUSTRIES, use_official, sample=args.sample)
-            print(f"  fetched {len(rd)} from reddit")
-            raw.extend(rd)
-            # Only mark the frozen archive "seeded" once we ACTUALLY got data - a
-            # transient total-failure must not permanently skip Reddit on later runs.
-            if not use_official and rd:
-                store["_meta"]["reddit_seeded"] = True
+            got = fn()
+            print(f"  fetched {len(got)} from {name}")
+            raw.extend(got)
         except Exception as e:
-            print(f"  [reddit] source failed entirely: {e}", file=sys.stderr)
+            print(f"  [{name}] source failed entirely: {e}", file=sys.stderr)
 
     kept = prefilter(raw, args.limit + 500)  # prefilter generously; split new/seen next
     # split against memory: classify only URLs we've never scored; bump the rest
