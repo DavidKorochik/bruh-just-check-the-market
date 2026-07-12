@@ -166,6 +166,48 @@ def test_fetch_one_sub_oauth_isolates_queries_and_skips_fallback():
     assert len(out) == 2         # partial results from the 2 good queries are kept
 
 
+def test_fetch_reddit_anon_circuit_breaker():
+    # anonymous path from a blocked IP: every sub returns nothing -> must bail after ANON_GIVEUP,
+    # not grind all 166 subs (which would blow the CI timeout)
+    seen = []
+
+    def fake_empty(name, token, queries):
+        seen.append(name)
+        return []
+
+    orig_token, orig_one = m._reddit_token, m._fetch_one_sub
+    m._reddit_token = lambda: None            # anonymous
+    m._fetch_one_sub = fake_empty
+    try:
+        out = m.fetch_reddit(m.INDUSTRIES)     # 166 subs available
+    finally:
+        m._reddit_token, m._fetch_one_sub = orig_token, orig_one
+
+    assert out == []
+    assert len(seen) == m.ANON_GIVEUP          # stopped early, did NOT touch all 166 subs
+    assert len(seen) < 20
+
+
+def test_fetch_reddit_oauth_not_circuit_broken():
+    # with a token, empty subs must NOT trigger the breaker (OAuth fails fast per-sub already);
+    # it should visit every sub in the (sampled) set
+    calls = []
+
+    def fake_one(name, token, queries):
+        calls.append(name)
+        return []
+
+    orig_token, orig_one = m._reddit_token, m._fetch_one_sub
+    m._reddit_token = lambda: "tok"
+    m._fetch_one_sub = fake_one
+    try:
+        m.fetch_reddit(m.INDUSTRIES, sample=True)   # 2 sectors x 1 sub = 2 subs
+    finally:
+        m._reddit_token, m._fetch_one_sub = orig_token, orig_one
+
+    assert len(calls) == 2   # visited both sampled subs; no early bail despite all-empty
+
+
 def test_reddit_row_parses_child_data():
     d = {"title": "t", "selftext": "body", "permalink": "/r/x/comments/1/t/",
          "subreddit": "x", "created_utc": 1700000000}

@@ -94,6 +94,9 @@ WATCH_AT = 40          # >= this -> watch, else skip
 # --- Fetch / cost knobs ---------------------------------------------------
 MAX_ITEMS = 200            # cap on how many NEW survivors get classified per run
 QUERIES_PER_SUB = 3        # pay-signal queries per sub when using the Reddit OAuth search API
+ANON_GIVEUP = 8            # anonymous Reddit: give up after this many subs in a row return nothing
+                           # (a blocked/rate-limited IP - e.g. CI without OAuth creds - else it grinds
+                           # all 166 subs' backoff and blows the job timeout)
 REDDIT_PAGE = 25
 HN_PAGE = 25
 REDDIT_SLEEP = 1.0        # polite pause between reddit calls
@@ -211,11 +214,24 @@ def fetch_reddit(industries, sample=False):
     sectors = industries[:2] if sample else industries
     n = 2 if sample else QUERIES_PER_SUB
     items = []
+    empty_streak = 0   # circuit breaker for the anonymous path
     for sec in sectors:
         subs = sec["subreddits"][:1] if sample else sec["subreddits"]
         queries = (sec.get("queries", [])[:1] + BASE_QUERIES)[:n]
         for sub in subs:
-            items.extend(_fetch_one_sub(sub["name"], token, queries))
+            got = _fetch_one_sub(sub["name"], token, queries)
+            items.extend(got)
+            # Anonymous from a blocked IP (e.g. CI without OAuth creds): RSS+pullpush both 429,
+            # so every sub returns nothing after ~28s of backoff. Grinding all 166 would blow the
+            # job timeout, so bail once a run of subs is clearly getting nowhere. OAuth (token) is
+            # not circuit-broken - it fails fast per-sub already.
+            if not token:
+                empty_streak = empty_streak + 1 if not got else 0
+                if empty_streak >= ANON_GIVEUP:
+                    print(f"  [reddit] {empty_streak} subs in a row returned nothing "
+                          f"(IP rate-limited); giving up on reddit for this run. Set REDDIT_CLIENT_ID/"
+                          f"SECRET for the OAuth backend, which works from any IP.", file=sys.stderr)
+                    return items
     return items
 
 
