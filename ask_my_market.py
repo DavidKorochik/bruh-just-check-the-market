@@ -47,6 +47,15 @@ from pathlib import Path
 import defusedxml.ElementTree as ET   # XXE / billion-laughs-safe parser for untrusted RSS
 import requests
 
+# Use the OS trust store (like curl) instead of only certifi's bundled CAs, so the tool works
+# from behind a corporate/SSL-inspection proxy whose CA the OS trusts but certifi doesn't.
+# No-op if truststore is missing or the platform has no usable store.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass
+
 from industries import BASE_QUERIES, HN_QUERIES, INDUSTRIES
 
 # =============================================================================
