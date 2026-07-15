@@ -1,17 +1,36 @@
 # bruh, just check the market
 
 A personal, economy-wide pain-discovery instrument. Not a product.
-It mines Reddit + Hacker News for one specific shape of opportunity:
+Built on one observation: real user pain is **distributed** across many places
+(subreddits, issue trackers, HN threads, Bluesky), so nobody sees it whole.
+This tool gathers it into one structured, summarized place and reads it through
+one opinionated filter:
 
 > A human being paid, or actively paying, to apply repeated judgment to a stream of information.
 
-That is the shape of an agentic product hiding in the open. Claude reads each
-candidate through one opinionated founder filter; every result carries its
-**industry** and **where those people gather**, so the output doubles as an
-outreach target list. It runs itself every 2 days and publishes a filterable
+That is the shape of an agentic product hiding in the open. The output is
+**pain-first**: what hurts, who it hurts, how often it resurfaces, and where those
+people gather - so every finding doubles as an outreach target, complete with a
+**ready-to-post discovery reply**. Product direction is derived from the pain,
+not the other way around. It runs itself every 2 days and publishes a filterable
 dashboard to GitHub Pages - no live server, no running cost.
 
-## What v2 adds
+## What v3 adds
+
+- **Pain-pattern synthesis.** Each scan ends with a CONCLUSION, not just rows: Claude clusters the
+  accumulated high-fit findings into recurring pain patterns (the pain in the sufferers' own
+  framing, who hurts, cross-source corroboration computed in Python, an optional product direction,
+  and a concrete discovery next step). Rendered as cards at the top of the dashboard, and as a
+  markdown digest on the Action run page.
+- **Draft discovery replies.** Every high-fit finding gets a short, honest reply you can post on
+  the source thread to open a customer-discovery conversation - references a concrete detail from
+  the post, asks exactly one workflow/frequency/cost question, never pitches, never poses as a
+  fellow sufferer.
+- **Two new sources.** GitHub issue search ("our tool can't do X, we do it by hand" attached to the
+  failing product itself - the purest paying-for-bad-tool evidence) and Bluesky public search
+  (in-the-moment operator complaints). Both free, no auth required.
+
+## What v2 added
 
 - **Whole economy, not just tech.** [`industries.py`](./industries.py) is a taxonomy of
   **36 GDP sectors / 166 operator subreddits** - agriculture, trucking, dental, legal,
@@ -19,20 +38,24 @@ dashboard to GitHub Pages - no live server, no running cost.
 - **Memory.** [`data/findings.json`](./data) accumulates across runs (dedup by URL) and tracks
   `times_seen` - a pain that keeps resurfacing is a stronger signal. The dashboard grows into a
   standing board instead of a throwaway snapshot.
-- **Hosted dashboard.** A GitHub Action runs the scan every 2 days and deploys a redesigned,
-  filterable dashboard (summary cards, live filters by verdict / industry / wtp-tier / source,
+- **Hosted dashboard.** A GitHub Action runs the scan every 2 days and deploys a filterable
+  dashboard (summary cards, live filters by verdict / industry / wtp-tier / source,
   full-text search) to GitHub Pages.
 
 ## The pipeline
 
 ```
-load memory -> fetch (Reddit + HN) -> prefilter -> skip already-seen
-  -> Claude judgment (new items only) -> competition check (web search, high-fit only)
-  -> merge into memory -> render dashboard -> open
+load memory -> fetch (Reddit + HN + GitHub issues + Bluesky) -> prefilter -> skip already-seen
+  -> Claude judgment (new items only) -> competition check + discovery replies (high-fit only)
+  -> merge into memory -> pain-pattern synthesis -> dashboard + digest
 ```
 
-Two files do the work: [`ask_my_market.py`](./ask_my_market.py) (logic) and
+Four files do the work: [`ask_my_market.py`](./ask_my_market.py) (pipeline + judgment),
+[`sources.py`](./sources.py) (fetchers), [`report.py`](./report.py) (dashboard + digest), and
 [`industries.py`](./industries.py) (the sector/subreddit/query taxonomy - edit freely).
+
+Model split: classification runs on **Haiku** (high-volume rubric work); competition, discovery
+replies, and pattern synthesis run on **Sonnet** (low-volume judgment the output is acted on).
 
 ## Run it locally
 
@@ -46,14 +69,25 @@ python ask_my_market.py --dry-run       # fetch + prefilter only, zero API cost
 python ask_my_market.py --sample --limit 20   # fast smoke test (tiny source subset)
 ```
 
+`ANTHROPIC_API_KEY` must be a **Console pay-as-you-go key** (`sk-ant-api03-...` from
+<https://console.anthropic.com>), not a Claude Max/Pro subscription - the subscription has no
+Messages-API key. Per full run: Haiku classification (~$0.45 at the 200-item cap) + Sonnet
+competition/replies/synthesis for the high-fit slice (~$0.40) - still under $1; incremental
+runs are pennies.
+
 Useful flags: `--limit N` (max NEW items classified), `--data PATH` (memory file),
-`--out PATH` (dashboard path), `--no-open`.
+`--out PATH` (dashboard path), `--no-open`, `--no-outreach` (skip discovery replies),
+`--no-patterns` (skip the synthesis). Optional: `GITHUB_TOKEN` triples the GitHub
+issue-search rate limit (automatic in Actions).
 
 ## Host it on GitHub Pages (zero running cost)
 
 One-time setup:
 
-1. **Add your Anthropic API key as a secret:**
+1. **Add your Anthropic API key as a secret.** It must be a **Console pay-as-you-go API key** from
+   <https://console.anthropic.com> (format `sk-ant-api03-...`), **not** a Claude Max/Pro subscription
+   credential - the subscription does not include an API key, and the Messages API rejects anything
+   else with `401 invalid x-api-key` (which aborts the run):
    ```bash
    gh secret set ANTHROPIC_API_KEY --repo DavidKorochik/bruh-just-check-the-market
    ```
@@ -130,13 +164,17 @@ python test_ask_my_market.py     # or: pytest -q
 ```
 
 No network, no API - covers scoring, thresholds, JSON parsing, boundary coercion, XSS/URL
-safety, persistence merge/bump, and prefilter community-balance.
+safety, persistence merge/bump, prefilter community-balance, pattern-synthesis coercion,
+source parsing (RSS/Bluesky/GitHub), and end-to-end `main()` failure guards (a dead API key
+or a wholesale classify failure exits nonzero and never re-deploys stale data).
 
 ## Roadmap (later sessions)
 
-Freelance-marketplace recurring-gig detection · competitor 1-2 star review mining · niche
-forums / vertical Slack-Discord archives · X / Bluesky · embedding-based clustering of duplicate
-pains · daily digest email of `worth_a_call` items.
+Freelance-marketplace recurring-gig detection (job posts ARE "paying a human" evidence) ·
+competitor 1-2 star review mining · app-store review mining (iTunes RSS is public JSON) ·
+niche Discourse forums (every instance exposes `/search.json`) · vertical Slack-Discord
+archives · embedding-based clustering of duplicate pains · daily digest email of
+`worth_a_call` items · alerting when a Reddit OAuth credential silently expires.
 
 If continuous monitoring of a public stream for a specific buyer validates in real founder
 conversations, *that* is when this monitoring engine becomes the product. Built for the decision,

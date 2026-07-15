@@ -1,4 +1,4 @@
 requests>=2.31
-anthropic>=0.40
+anthropic>=0.47   # first version whose messages.create accepts the `thinking` kwarg
 defusedxml>=0.7
 truststore>=0.9

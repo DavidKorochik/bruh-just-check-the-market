@@ -22,7 +22,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 55   # first seed run grinds slowly through pullpush backoffs across ~166 subs
+    timeout-minutes: 55   # headroom for a full run: reddit OAuth across ~166 subs + classify + enrich
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -41,7 +41,12 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}          # reddit OAuth (works from CI IPs)
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          GITHUB_TOKEN: ${{ github.token }}                          # 3x the GitHub search rate limit
         run: python ask_my_market.py --no-open --out public/index.html --data data/findings.json
+
+      - name: Publish scan digest to the job summary
+        if: always()   # the digest is the run's conclusion; show it right on the run page
+        run: if [ -f public/digest.md ]; then cat public/digest.md >> "$GITHUB_STEP_SUMMARY"; fi
 
       - name: Commit updated memory
         run: |

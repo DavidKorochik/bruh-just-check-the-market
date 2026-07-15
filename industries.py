@@ -22,6 +22,28 @@ BASE_QUERIES = [
 # Hacker News (tech/founder audience) - kept narrow; Reddit carries the breadth.
 HN_QUERIES = ["how do you track", "tired of manually", "wish there was a tool", "still doing this by hand"]
 
+# GitHub issue search - "our tool can't do X, we do it by hand" lives in issue trackers.
+# Quoted phrases, searched across all public repos, newest first. The strongest
+# paying_for_bad_tool signal anywhere: the complaint is attached to the failing product itself.
+GITHUB_QUERIES = [
+    '"we currently do this manually"',
+    '"have to do this manually"',
+    '"wish there was a way to"',
+    '"spend hours" manually',
+    '"paying someone to"',
+    '"export to a spreadsheet and"',
+]
+
+# Bluesky public search (no auth) - the post-Twitter stream of in-the-moment operator complaints.
+BLUESKY_QUERIES = [
+    '"paying someone to"',
+    '"hired a va"',
+    '"wish there was a tool"',
+    '"still doing this manually"',
+    '"spend hours every week"',
+    '"why is there no app"',
+]
+
 INDUSTRIES = [
     {"sector": "Agriculture, farming, ranching & commercial fishing",
      "subreddits": [
